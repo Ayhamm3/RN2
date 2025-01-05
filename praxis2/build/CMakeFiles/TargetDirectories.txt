@@ -1,0 +1,5 @@
+/mnt/c/Users/A/Desktop/praxis2/build/CMakeFiles/webserver.dir
+/mnt/c/Users/A/Desktop/praxis2/build/CMakeFiles/package.dir
+/mnt/c/Users/A/Desktop/praxis2/build/CMakeFiles/package_source.dir
+/mnt/c/Users/A/Desktop/praxis2/build/CMakeFiles/edit_cache.dir
+/mnt/c/Users/A/Desktop/praxis2/build/CMakeFiles/rebuild_cache.dir
