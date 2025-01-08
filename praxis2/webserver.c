@@ -16,68 +16,134 @@
 #include "http.h"
 #include "util.h"
 
+#define HTTP_OK "200 OK"
+#define HTTP_NOT_FOUND "404 Not Found"
+#define HTTP_METHOD_NOT_ALLOWED "405 Method Not Allowed"
+#define HTTP_INTERNAL_SERVER_ERROR "500 Internal Server Error"
+
+// Define some constants for Content Types
+#define CONTENT_TYPE_HTML "Content-Type: text/html\r\n"
+#define CONTENT_TYPE_JSON "Content-Type: application/json\r\n"
 
 
 #define MAX_RESOURCES 100
+#define MAX_REQUESTS 10
 
 struct tuple resources[MAX_RESOURCES] = {
     {"/static/foo", "Foo", sizeof "Foo" - 1},
     {"/static/bar", "Bar", sizeof "Bar" - 1},
     {"/static/baz", "Baz", sizeof "Baz" - 1}};
 
-/**
- * Sends an HTTP reply to the client based on the received request.
- *
- * @param conn      The file descriptor of the client connection socket.
- * @param request   A pointer to the struct containing the parsed request
- * information.
- */
-void send_reply(int conn, struct request *request) {
 
-    // Create a buffer to hold the HTTP reply
-    char buffer[HTTP_MAX_SIZE];
-    char *reply = buffer;
-    size_t offset = 0;
+struct message {
+    uint8_t message_type;        // 1 byte
+    uint16_t hash_id;     // 2 bytes
+    uint16_t node_id;     // 2 bytes
+    struct in_addr ip_address;      // 4 bytes 
+    uint16_t node_port;     // 2 bytes
+} __attribute__((packed));
+
+struct lookup_request {
+    uint16_t hash_id;     // Unique identifier for the request
+    char* node_ip;     // Node IP (IPv4 as string, e.g., "127.0.0.1")
+    uint16_t node_port;   // Node port
+};
+
+int request_count = 0; // Tracks the number of stored requests
+struct lookup_request requests[MAX_REQUESTS];
+
+char *PRED_ID, *PRED_IP, *PRED_PORT, *SUCC_ID, *SUCC_IP, *SUCC_PORT, *ID, *IP, *PORT;
+
+void send_reply(int conn, struct request *request, int udp_socket);
+size_t process_packet(int conn, char *buffer, size_t n, int udp_socket);
+static void connection_setup(struct connection_state *state, int sock);
+char *buffer_discard(char *buffer, size_t discard, size_t keep);
+bool handle_connection(struct connection_state *state, int udp_socket);
+static struct sockaddr_in derive_sockaddr(const char *host, const char *port);
+static int setup_server_socket(struct sockaddr_in addr);
+static int setup_datagram_socket(const char *host, const char *port);
+void send_udp_message(int socket ,uint8_t message_type, uint16_t hash_id, uint16_t node_id, char* ip_address, uint16_t node_port, struct in_addr send_ip, uint16_t send_port);
+void add_request(struct lookup_request new_request);
+int has_request(uint16_t hash_id);
+void find_and_write(uint16_t hash_id, char* ip, char* port);
+int fetch_req_index(uint16_t hash_id);
+
+void send_reply(int conn, struct request *request, int udp_socket) {
+    // Common HTTP response templates
+    const char *OK_REPLY_FORMAT = "HTTP/1.1 200 OK\r\nContent-Length: %lu\r\n\r\n";
+    const char *NOT_FOUND_REPLY = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+    const char *SERVICE_UNAVAILABLE_REPLY = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n";
+    const char *METHOD_NOT_SUPPORTED_REPLY = "HTTP/1.1 501 Method Not Supported\r\n\r\n";
+    const char *NO_CONTENT_REPLY = "HTTP/1.1 204 No Content\r\n\r\n";
+    const char *CREATED_REPLY = "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n";
+    const char *SEE_OTHER_REPLY_FORMAT = "HTTP/1.1 303 See Other\r\nLocation:%s:%s%s\r\nContent-Length: 0\r\n\r\n";
 
     fprintf(stderr, "Handling %s request for %s (%lu byte payload)\n",
             request->method, request->uri, request->payload_length);
 
+    uint16_t uri_hash = pseudo_hash((const unsigned char *)request->uri, strlen(request->uri));
+    char uri_hash_string[6];
+    snprintf(uri_hash_string, sizeof(uri_hash_string), "%u", uri_hash);
+
+    // Buffer to store the reply
+    char buffer[HTTP_MAX_SIZE];
+    const char *reply = buffer;  // Change reply to const char* to avoid warnings
+    size_t offset = 0;
+
     if (strcmp(request->method, "GET") == 0) {
-        // Find the resource with the given URI in the 'resources' array.
         size_t resource_length;
-        const char *resource =
-            get(request->uri, resources, MAX_RESOURCES, &resource_length);
+        const char *resource = get(uri_hash_string, resources, MAX_RESOURCES, &resource_length);
 
         if (resource) {
-            size_t payload_offset =
-                sprintf(reply, "HTTP/1.1 200 OK\r\nContent-Length: %lu\r\n\r\n",
-                        resource_length);
-            memcpy(reply + payload_offset, resource, resource_length);
-            offset = payload_offset + resource_length;
+            // Resource found
+            offset = snprintf(reply, HTTP_MAX_SIZE, OK_REPLY_FORMAT, resource_length);
+            memcpy((char*)reply + offset, resource, resource_length);  // Cast to modify content
+            offset += resource_length;
         } else {
-            reply = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+            // Resource not found
+            if (strcmp(PRED_ID, SUCC_ID) == 0 && uri_hash != atoi(ID)) {
+                reply = NOT_FOUND_REPLY;
+            } else {
+                if (!has_request(uri_hash)) {
+                    // Request not in progress, send service unavailable
+                    reply = SERVICE_UNAVAILABLE_REPLY;
+
+                    struct sockaddr_in udp_addr = derive_sockaddr(SUCC_IP, SUCC_PORT);
+                    send_udp_message(udp_socket, 0, htons(uri_hash), htons(atoi(ID)), IP, htons(atoi(PORT)), udp_addr.sin_addr, udp_addr.sin_port);
+
+                    struct lookup_request new_request = {uri_hash, NULL, 0};
+                    add_request(new_request);
+                } else {
+                    // Request in progress, check if we have an answer
+                    int index = fetch_req_index(uri_hash);
+                    if (requests[index].node_ip == NULL || requests[index].node_port == NULL) {
+                        reply = NOT_FOUND_REPLY;
+                    } else {
+                        snprintf(reply, HTTP_MAX_SIZE, SEE_OTHER_REPLY_FORMAT,
+                                 requests[index].node_ip, requests[index].node_port, request->uri);
+                        memset(&requests[index], 0, sizeof(struct request));
+                    }
+                }
+            }
             offset = strlen(reply);
         }
     } else if (strcmp(request->method, "PUT") == 0) {
-        // Try to set the requested resource with the given payload in the
-        // 'resources' array.
-        if (set(request->uri, request->payload, request->payload_length,
-                resources, MAX_RESOURCES)) {
-            reply = "HTTP/1.1 204 No Content\r\n\r\n";
+        if (set(uri_hash_string, request->payload, request->payload_length, resources, MAX_RESOURCES)) {
+            reply = NO_CONTENT_REPLY;
         } else {
-            reply = "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n";
+            reply = CREATED_REPLY;
         }
         offset = strlen(reply);
     } else if (strcmp(request->method, "DELETE") == 0) {
-        // Try to delete the requested resource from the 'resources' array
-        if (delete (request->uri, resources, MAX_RESOURCES)) {
-            reply = "HTTP/1.1 204 No Content\r\n\r\n";
+        if (delete(uri_hash_string, resources, MAX_RESOURCES)) {
+            reply = NO_CONTENT_REPLY;
         } else {
-            reply = "HTTP/1.1 404 Not Found\r\n\r\n";
+            reply = NOT_FOUND_REPLY;
         }
         offset = strlen(reply);
     } else {
-        reply = "HTTP/1.1 501 Method Not Supported\r\n\r\n";
+        // Unsupported method
+        reply = METHOD_NOT_SUPPORTED_REPLY;
         offset = strlen(reply);
     }
 
@@ -87,6 +153,208 @@ void send_reply(int conn, struct request *request) {
         close(conn);
     }
 }
+
+int main(int argc, char **argv) {
+    // uint16_t h1 = pseudo_hash("/static/foo", sizeof "/static/foo" - 1);
+    // uint16_t h2 = pseudo_hash("/static/bar", sizeof "/static/bar" - 1);
+    // uint16_t h3 = pseudo_hash("/static/baz", sizeof "/static/baz" - 1);
+    // printf("%d , %d, %d \n", h1,h2,h3);
+    PRED_ID = getenv("PRED_ID");
+    PRED_IP = getenv("PRED_IP");
+    PRED_PORT = getenv("PRED_PORT");
+    SUCC_ID = getenv("SUCC_ID");
+    SUCC_IP = getenv("SUCC_IP");
+    SUCC_PORT = getenv("SUCC_PORT");
+    if (argc > 3) {
+        ID = argv[3];
+    } else {
+        ID = "0"; 
+    }
+    IP = argv[1];
+    PORT = argv[2];
+
+    
+    memset(requests, 0, sizeof(requests));
+    
+
+    // printf("PRED_ID=%s, PRED_IP=%s, PRED_PORT=%s, SUCC_ID=%s, SUCC_IP=%s, SUCC_PORT=%s, ID=%s\n", 
+    // PRED_ID, PRED_IP, PRED_PORT, SUCC_ID, SUCC_IP, SUCC_PORT, ID);
+
+    struct sockaddr_in addr = derive_sockaddr(argv[1], argv[2]);
+
+    // Set up a server socket.
+    int server_socket = setup_server_socket(addr);
+
+    // Set up a datagram socket
+    int datagram_socket = setup_datagram_socket(argv[1], argv[2]);
+
+    // Create an array of pollfd structures to monitor sockets.
+    struct pollfd sockets[2] = {
+        {.fd = server_socket, .events = POLLIN},
+        {.fd = datagram_socket, .events = POLLIN},
+    };
+
+    struct connection_state state = {0};
+    while (true) {
+
+        // Use poll() to wait for events on the monitored sockets.
+        int ready = poll(sockets, sizeof(sockets) / sizeof(sockets[0]), -1);
+        if (ready == -1) {
+            perror("poll");
+            exit(EXIT_FAILURE);
+        }
+        printf("UDP socket descriptor: %d\n", datagram_socket);
+        // Process events on the monitored sockets.
+        for (size_t i = 0; i < sizeof(sockets) / sizeof(sockets[0]); i += 1) {
+            if (sockets[i].revents != POLLIN) {
+                // If there are no POLLIN events on the socket, continue to the
+                // next iteration.
+                continue;
+            }
+            int s = sockets[i].fd;
+
+            if (s == server_socket) {
+                printf("doing tcp\n");
+                // If the event is on the server_socket, accept a new connection
+                // from a client.
+                int connection = accept(server_socket, NULL, NULL);
+                if (connection == -1 && errno != EAGAIN &&
+                    errno != EWOULDBLOCK) {
+                    close(server_socket);
+                    perror("accept");
+                    exit(EXIT_FAILURE);
+                } else {
+                    connection_setup(&state, connection);
+
+                    // limit to one connection at a time
+                    sockets[0].events = 0;
+                    sockets[1].fd = connection;
+                    sockets[1].events = POLLIN;
+                }
+                printf("end tcp\n");
+            } else if (s == datagram_socket) {
+                char buffer[1024];
+                struct sockaddr_in sender_addr;
+                socklen_t addr_len = sizeof(sender_addr);
+
+                ssize_t num_bytes = recvfrom(s, buffer, sizeof(buffer), 0,
+                                            (struct sockaddr *)&sender_addr, &addr_len);
+                if (num_bytes == -1) {
+                    perror("recvfrom");
+                    continue;
+                }
+
+                if (num_bytes < sizeof(struct message)) {
+                    fprintf(stderr, "Received message is too short to unpack\n");
+                    continue;
+                }
+
+                // Cast the buffer to a pointer to your struct message
+                struct message *received_msg = (struct message *)buffer;
+
+                // Access the fields of the unpacked struct
+                printf("Received UDP message:\n");
+                printf("  Message Type: %u\n", received_msg->message_type);
+                printf("  PRED ID: %u\n", atoi(PRED_ID)); 
+                printf("  CURR ID: %u\n", atoi(ID)); 
+                printf("  Hash ID: %u\n", ntohs(received_msg->hash_id));  // Convert from network to host byte order
+                printf("  SUCC ID: %u\n", atoi((SUCC_ID))); 
+                printf("  Node ID: %u\n", ntohs(received_msg->node_id));  // Convert from network to host byte order
+                char ip_str[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &received_msg->ip_address, ip_str, sizeof(ip_str)); // Convert IP to string
+                printf("  IP Address: %s\n", ip_str);
+                printf("  Node Port: %u\n", ntohs(received_msg->node_port)); 
+                printf("  SUCC IP: %s\n", SUCC_IP);
+                printf("  SUCC Port: %s\n", SUCC_PORT); 
+
+                if (received_msg->message_type == 0) {
+                    if (ntohs(received_msg->hash_id) > atoi(ID) && ntohs(received_msg->hash_id) < atoi(SUCC_ID)) { // Successor responsible
+                        printf("res\n");
+                        send_udp_message(datagram_socket , 1, htons(atoi(ID)), htons(atoi(SUCC_ID)), SUCC_IP, htons(atoi(SUCC_PORT)), 
+                        received_msg->ip_address, received_msg->node_port);
+                    } else if (ntohs(received_msg->hash_id) < atoi(ID) && ntohs(received_msg->hash_id) > atoi(SUCC_ID)) { // Current responsible
+                        send_udp_message(datagram_socket , 1, htons(atoi(PRED_ID)), htons(atoi(ID)), IP, htons(atoi(PORT)), 
+                        received_msg->ip_address, received_msg->node_port);
+                    } else { // forward lookup
+                        char ip_succ[INET_ADDRSTRLEN];
+                        inet_ntop(AF_INET, &received_msg->ip_address, ip_str, sizeof(ip_str));
+
+                        
+                        if (strcmp(ip_succ, SUCC_IP) == 0 || atoi(SUCC_PORT) == ntohs(received_msg->node_port)) {
+                            printf("end of line sending reply to originator\n");
+                            struct sockaddr_in udp_addr;
+                            memset(&udp_addr, 0, sizeof(udp_addr));
+                            udp_addr.sin_family = AF_INET;
+                            udp_addr.sin_port = htons(atoi(SUCC_PORT));         
+                            inet_pton(AF_INET, SUCC_IP, &udp_addr.sin_addr); 
+
+                            char ip_str[INET_ADDRSTRLEN];
+                            inet_ntop(AF_INET, &received_msg->ip_address, ip_str, sizeof(ip_str));
+                            send_udp_message(datagram_socket , 1, received_msg->hash_id, received_msg->node_id, 
+                            ip_str, received_msg->node_port, udp_addr.sin_addr, udp_addr.sin_port);    
+                        } else {
+                            printf("forward kek\n");
+                            struct sockaddr_in udp_addr;
+                            memset(&udp_addr, 0, sizeof(udp_addr));
+                            udp_addr.sin_family = AF_INET;
+                            udp_addr.sin_port = htons(atoi(SUCC_PORT));         
+                            inet_pton(AF_INET, SUCC_IP, &udp_addr.sin_addr); 
+
+                            char ip_str[INET_ADDRSTRLEN];
+                            inet_ntop(AF_INET, &received_msg->ip_address, ip_str, sizeof(ip_str));
+                            send_udp_message(datagram_socket , received_msg->message_type, received_msg->hash_id, received_msg->node_id, 
+                            ip_str, received_msg->node_port, udp_addr.sin_addr, udp_addr.sin_port);    
+                        }
+                         
+                    }
+                } else {
+                    printf("got reply\n");
+                    // find lookup in requests[] and write
+                    int index = fetch_req_index(received_msg->hash_id);
+                    if (index >= 0) {
+                        printf("request found overwriting...\n");
+                        inet_ntop(AF_INET, &received_msg->ip_address, requests[index].node_ip, sizeof(requests[index].node_ip));
+                        requests[index].node_port = received_msg->node_port;
+                    } else {
+                        printf("request not found\n");
+                        perror("hash not found");
+                    }
+                }
+                
+
+            } else  {
+                assert(s == state.sock);
+
+                // Call the 'handle_connection' function to process the incoming
+                // data on the socket.
+                bool cont = handle_connection(&state, datagram_socket);
+                if (!cont) { // get ready for a new connection
+                    printf("reset\n");
+                    sockets[0].events = POLLIN;
+                    sockets[1].events = POLLIN;
+                    sockets[2].fd = -1;
+                    sockets[2].events = 0;
+                    if (sockets[1].fd != datagram_socket) {
+                        sockets[1].fd = -1;
+                        sockets[1].events = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    return EXIT_SUCCESS;
+}
+
+/**
+ * Sends an HTTP reply to the client based on the received request.
+ *
+ * @param conn      The file descriptor of the client connection socket.
+ * @param request   A pointer to the struct containing the parsed request
+ * @param upd_socket UDP Socket for DHT lookups
+ * information.
+ */
+
 
 /**
  * Processes an incoming packet from the client.
@@ -101,13 +369,13 @@ void send_reply(int conn, struct request *request) {
  * malformed or an error occurs during processing, the return value is -1.
  *
  */
-size_t process_packet(int conn, char *buffer, size_t n) {
+size_t process_packet(int conn, char *buffer, size_t n, int udp_socket) {
     struct request request = {
         .method = NULL, .uri = NULL, .payload = NULL, .payload_length = -1};
     ssize_t bytes_processed = parse_request(buffer, n, &request);
 
     if (bytes_processed > 0) {
-        send_reply(conn, &request);
+        send_reply(conn, &request, udp_socket);
 
         // Check the "Connection" header in the request to determine if the
         // connection should be kept alive or closed.
@@ -175,7 +443,7 @@ char *buffer_discard(char *buffer, size_t discard, size_t keep) {
  * false otherwise. If an error occurs while receiving data from the socket, the
  * function exits the program.
  */
-bool handle_connection(struct connection_state *state) {
+bool handle_connection(struct connection_state *state, int udp_socket) {
     // Calculate the pointer to the end of the buffer to avoid buffer overflow
     const char *buffer_end = state->buffer + HTTP_MAX_SIZE;
 
@@ -195,7 +463,7 @@ bool handle_connection(struct connection_state *state) {
 
     ssize_t bytes_processed = 0;
     while ((bytes_processed = process_packet(state->sock, window_start,
-                                             window_end - window_start)) > 0) {
+                                             window_end - window_start, udp_socket)) > 0) {
         window_start += bytes_processed;
     }
     if (bytes_processed == -1) {
@@ -289,229 +557,115 @@ static int setup_server_socket(struct sockaddr_in addr) {
     return sock;
 }
 
-/**
- *  The program expects 3; otherwise, it returns EXIT_FAILURE.
- *
- *  Call as:
- *
- *  ./build/webserver self.ip self.port
- */
-// Function prototypes for TCP and UDP setup
-int start_tcp_server(const char *ip, int port);
-int start_udp_server(const char *ip, int port);
-void handle_sockets(int tcp_sock, int udp_sock);
+static int setup_datagram_socket(const char *host, const char *port) {
+    struct addrinfo hints, *servinfo, *p;
+    const int enable = 1;
+    int rv, sock;
 
-int main(int argc, char *argv[]) {
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <IP> <Port>\n", argv[0]);
-        return EXIT_FAILURE;
-    }
-
-    const char *ip = argv[1];
-    const char *port_str = argv[2];
-    int port = atoi(port_str);
-
-    // Use derive_sockaddr to create sockaddr_in structure
-    struct sockaddr_in addr = derive_sockaddr(ip, port_str);
-
-    // Start TCP server using setup_server_socket
-    int tcp_sock = setup_server_socket(addr);
-    if (tcp_sock < 0) {
-        fprintf(stderr, "Failed to set up TCP server\n");
-        return EXIT_FAILURE;
-    }
-
-    // Start UDP server
-    int udp_sock = start_udp_server(ip, port);
-    if (udp_sock < 0) {
-        fprintf(stderr, "Failed to set up UDP server\n");
-        close(tcp_sock);
-        return EXIT_FAILURE;
-    }
-
-    printf("Server is running on %s:%d (TCP and UDP)\n", ip, port);
-
-    fd_set read_fds;
-    int max_fd = (tcp_sock > udp_sock) ? tcp_sock : udp_sock;
-
-    while (1) {
-        FD_ZERO(&read_fds);
-        FD_SET(tcp_sock, &read_fds);
-        FD_SET(udp_sock, &read_fds);
-
-        printf("Waiting for incoming connections or messages...\n");
-
-        int activity = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
-        if (activity < 0 && errno != EINTR) {
-            perror("select");
-            break;
-        }
-
-        // Handle TCP connections
-        if (FD_ISSET(tcp_sock, &read_fds)) {
-            struct sockaddr_in client_addr;
-            socklen_t client_len = sizeof(client_addr);
-            int client_sock = accept(tcp_sock, (struct sockaddr *)&client_addr, &client_len);
-            if (client_sock < 0) {
-                perror("TCP accept");
-                continue;
-            }
-
-            char client_ip[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
-            printf("New TCP connection from %s:%d\n", client_ip, ntohs(client_addr.sin_port));
-
-            // Use connection_setup to initialize connection state
-            struct connection_state state;
-            connection_setup(&state, client_sock);
-
-            // Handle the client connection
-            while (handle_connection(&state))
-                ;
-
-            close(client_sock);
-        }
-
-        // Handle UDP messages
-        if (FD_ISSET(udp_sock, &read_fds)) {
-            struct sockaddr_in client_addr;
-            socklen_t client_len = sizeof(client_addr);
-            char buffer[1024] = {0};
-
-            ssize_t bytes_received = recvfrom(udp_sock, buffer, sizeof(buffer) - 1, 0,
-                                              (struct sockaddr *)&client_addr, &client_len);
-            if (bytes_received < 0) {
-                perror("UDP recvfrom");
-                continue;
-            }
-
-            char client_ip[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
-            printf("Received UDP message from %s:%d: %s\n", client_ip, ntohs(client_addr.sin_port), buffer);
-
-            // Respond to the UDP client
-            sendto(udp_sock, "Hello from UDP server!", 23, 0,
-                   (struct sockaddr *)&client_addr, client_len);
-        }
-    }
-
-    // Close sockets
-    close(tcp_sock);
-    close(udp_sock);
-
-    return EXIT_SUCCESS;
-}
-
-
-int start_tcp_server(const char *ip, int port) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        perror("TCP socket");
-        return -1;
-    }
-
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    inet_pton(AF_INET, ip, &addr.sin_addr);
-
-    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("TCP bind");
-        close(sock);
-        return -1;
-    }
-
-    if (listen(sock, 10) < 0) {
-        perror("TCP listen");
-        close(sock);
-        return -1;
-    }
-
-    return sock;
-}
-
-int start_udp_server(const char *ip, int port) {
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
+    if (sock == -1) {
         perror("UDP socket");
-        return -1;
+        exit(EXIT_FAILURE);
     }
 
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    inet_pton(AF_INET, ip, &addr.sin_addr);
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET; 
+    hints.ai_socktype = SOCK_DGRAM;
 
-    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("UDP bind");
-        close(sock);
-        return -1;
+    if ((rv = getaddrinfo(host, port, &hints, &servinfo)) != 0) {
+        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
+        exit(EXIT_FAILURE);
+    }
+    
+    struct sockaddr_in result = *((struct sockaddr_in *)servinfo->ai_addr);
+
+    for(p = servinfo; p != NULL; p = p->ai_next) {
+        if ((sock = socket(p->ai_family, p->ai_socktype,
+                p->ai_protocol)) == -1) {
+            perror("talker: socket");
+            continue;
+        }
+
+        break;
     }
 
+    if (fcntl(sock, F_SETFL, O_NONBLOCK) == -1) {
+        perror("fcntl");
+        exit(EXIT_FAILURE);
+    }
+
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable)) ==
+        -1) {
+        perror("setsockopt");
+        exit(EXIT_FAILURE);
+    }
+
+    if (p == NULL) {
+        fprintf(stderr, "talker: failed to create socket\n");
+        freeaddrinfo(servinfo);
+        exit(EXIT_FAILURE);
+    }
+
+    if (bind(sock, (struct sockaddr *)&result, sizeof(result)) == -1) {
+        perror("bind");
+        exit(EXIT_FAILURE);
+    }
+
+    freeaddrinfo(servinfo);
     return sock;
 }
 
-void handle_sockets(int tcp_sock, int udp_sock) {
-    fd_set read_fds;
-    int max_fd = (tcp_sock > udp_sock) ? tcp_sock : udp_sock;
+void send_udp_message(int socket ,uint8_t message_type, uint16_t hash_id, uint16_t node_id, char* ip_address, uint16_t node_port, struct in_addr send_ip, uint16_t send_port) {
+    struct message udp_message;
+    udp_message.message_type = message_type;
+    udp_message.hash_id = hash_id; 
+    udp_message.node_id = node_id;
+    inet_pton(AF_INET, ip_address, &udp_message.ip_address); // Convert IP address to binary format
+    udp_message.node_port = node_port;      // Convert port to network byte order
 
-    while (1) {
-        FD_ZERO(&read_fds);
-        FD_SET(tcp_sock, &read_fds);
-        FD_SET(udp_sock, &read_fds);
+    // Define the UDP address
+    struct sockaddr_in udp_addr;
+    memset(&udp_addr, 0, sizeof(udp_addr));
+    udp_addr.sin_family = AF_INET;
+    udp_addr.sin_port = send_port;          // UDP port (already in network byte order)
+    udp_addr.sin_addr = send_ip;
+    // inet_pton(AF_INET, send_ip, &udp_addr.sin_addr); 
 
-        printf("Waiting for incoming connections or messages...\n");
+    // Send the message over UDP
+    if (sendto(socket, &udp_message, sizeof(udp_message), 0,
+            (struct sockaddr*)&udp_addr, sizeof(udp_addr)) < 0) {
+        perror("Failed to send UDP message");
+    } 
+}
 
-        int activity = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
-        if (activity < 0 && errno != EINTR) {
-            perror("select");
-            break;
-        }
+void add_request(struct lookup_request new_request) {
+    // If the list is full, overwrite the oldest request
+    if (request_count >= MAX_REQUESTS) {
+        request_count = 0; // Reset to the start of the array
+    }
+    requests[request_count] = new_request;
+    (request_count)++;
+}
 
-        // Handle TCP connections
-        if (FD_ISSET(tcp_sock, &read_fds)) {
-            struct sockaddr_in client_addr;
-            socklen_t client_len = sizeof(client_addr);
-            int client_sock = accept(tcp_sock, (struct sockaddr *)&client_addr, &client_len);
-            if (client_sock < 0) {
-                perror("TCP accept");
-                continue;
-            }
+int has_request(uint16_t hash_id) {
+    for (int i = 0;i < MAX_REQUESTS;i++) {
+        if (requests[i].hash_id == hash_id) return 1;
+    }
+    return 0;
+}
 
-            char client_ip[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
-            printf("New TCP connection from %s:%d\n", client_ip, ntohs(client_addr.sin_port));
-
-            // Handle the client connection (this can be extended as needed)
-            char buffer[1024] = {0};
-            ssize_t bytes_read = recv(client_sock, buffer, sizeof(buffer) - 1, 0);
-            if (bytes_read > 0) {
-                printf("TCP client said: %s\n", buffer);
-                send(client_sock, "Hello from TCP server!", 23, 0);
-            }
-            close(client_sock);
-        }
-
-        // Handle UDP messages
-        if (FD_ISSET(udp_sock, &read_fds)) {
-            struct sockaddr_in client_addr;
-            socklen_t client_len = sizeof(client_addr);
-            char buffer[1024] = {0};
-
-            ssize_t bytes_received = recvfrom(udp_sock, buffer, sizeof(buffer) - 1, 0,
-                                              (struct sockaddr *)&client_addr, &client_len);
-            if (bytes_received < 0) {
-                perror("UDP recvfrom");
-                continue;
-            }
-
-            char client_ip[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
-            printf("Received UDP message from %s:%d: %s\n", client_ip, ntohs(client_addr.sin_port), buffer);
-
-            // Respond to the UDP client
-            sendto(udp_sock, "Hello from UDP server!", 23, 0,
-                   (struct sockaddr *)&client_addr, client_len);
+void find_and_write(uint16_t hash_id, char* ip, char* port) {
+    for (int i = 0;i < MAX_REQUESTS;i++) {
+        if (requests[i].hash_id == hash_id) {
+            requests[i].node_ip = ip;
+            requests[i].node_port = port;
+            return;
         }
     }
+}
+
+int fetch_req_index(uint16_t hash_id) {
+    for (int i = 0;i < MAX_REQUESTS;i++) {
+        if (requests[i].hash_id == hash_id) return i;
+    }
+    return -1;
 }
