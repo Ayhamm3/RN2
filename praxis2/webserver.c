@@ -77,9 +77,24 @@ void send_reply(int conn, struct request *request, int udp_socket) {
     char uri_hash_string[6];
     snprintf(uri_hash_string, sizeof(uri_hash_string), "%u", uri_hash);
 
+    // Inline helper functions
+    int has_request(uint16_t hash_id) {
+        for (int i = 0; i < MAX_REQUESTS; i++) {
+            if (requests[i].hash_id == hash_id) return 1;
+        }
+        return 0;
+    }
+
+    int fetch_req_index(uint16_t hash_id) {
+        for (int i = 0; i < MAX_REQUESTS; i++) {
+            if (requests[i].hash_id == hash_id) return i;
+        }
+        return -1;
+    }
+
     // Buffer to store the reply
     char buffer[HTTP_MAX_SIZE];
-    const char *reply = buffer;  // Change reply to const char* to avoid warnings
+    const char *reply = buffer;
     size_t offset = 0;
 
     if (strcmp(request->method, "GET") == 0) {
@@ -89,7 +104,7 @@ void send_reply(int conn, struct request *request, int udp_socket) {
         if (resource) {
             // Resource found
             offset = snprintf(reply, HTTP_MAX_SIZE, OK_REPLY_FORMAT, resource_length);
-            memcpy((char*)reply + offset, resource, resource_length);  // Cast to modify content
+            memcpy((char*)reply + offset, resource, resource_length);
             offset += resource_length;
         } else {
             // Resource not found
@@ -103,12 +118,18 @@ void send_reply(int conn, struct request *request, int udp_socket) {
                     struct sockaddr_in udp_addr = derive_sockaddr(SUCC_IP, SUCC_PORT);
                     send_udp_message(udp_socket, 0, htons(uri_hash), htons(atoi(ID)), IP, htons(atoi(PORT)), udp_addr.sin_addr, udp_addr.sin_port);
 
+                    // Inline add_request logic
+                    static int request_count = 0;  // Ensure this is declared
                     struct lookup_request new_request = {uri_hash, NULL, 0};
-                    add_request(new_request);
+                    if (request_count >= MAX_REQUESTS) {
+                        request_count = 0;  // Reset to the start of the array
+                    }
+                    requests[request_count] = new_request;
+                    request_count++;
                 } else {
                     // Request in progress, check if we have an answer
                     int index = fetch_req_index(uri_hash);
-                    if (requests[index].node_ip == NULL || requests[index].node_port == NULL) {
+                    if (index == -1 || requests[index].node_ip == NULL || requests[index].node_port == NULL) {
                         reply = NOT_FOUND_REPLY;
                     } else {
                         snprintf(reply, HTTP_MAX_SIZE, SEE_OTHER_REPLY_FORMAT,
@@ -146,15 +167,12 @@ void send_reply(int conn, struct request *request, int udp_socket) {
     }
 }
 
+
 static int setup_datagram_socket(const char *host, const char *port);
 static int setup_server_socket(struct sockaddr_in addr);
 static void connection_setup(struct connection_state *state, int sock);
 bool handle_connection(struct connection_state *state, int udp_socket);
 int main(int argc, char **argv) {
-    // uint16_t h1 = pseudo_hash("/static/foo", sizeof "/static/foo" - 1);
-    // uint16_t h2 = pseudo_hash("/static/bar", sizeof "/static/bar" - 1);
-    // uint16_t h3 = pseudo_hash("/static/baz", sizeof "/static/baz" - 1);
-    // printf("%d , %d, %d \n", h1,h2,h3);
     PRED_ID = getenv("PRED_ID");
     PRED_IP = getenv("PRED_IP");
     PRED_PORT = getenv("PRED_PORT");
@@ -169,12 +187,7 @@ int main(int argc, char **argv) {
     IP = argv[1];
     PORT = argv[2];
 
-    
     memset(requests, 0, sizeof(requests));
-    
-
-    // printf("PRED_ID=%s, PRED_IP=%s, PRED_PORT=%s, SUCC_ID=%s, SUCC_IP=%s, SUCC_PORT=%s, ID=%s\n", 
-    // PRED_ID, PRED_IP, PRED_PORT, SUCC_ID, SUCC_IP, SUCC_PORT, ID);
 
     struct sockaddr_in addr = derive_sockaddr(argv[1], argv[2]);
 
@@ -275,7 +288,6 @@ int main(int argc, char **argv) {
                         char ip_succ[INET_ADDRSTRLEN];
                         inet_ntop(AF_INET, &received_msg->ip_address, ip_str, sizeof(ip_str));
 
-                        
                         if (strcmp(ip_succ, SUCC_IP) == 0 || atoi(SUCC_PORT) == ntohs(received_msg->node_port)) {
                             printf("end of line sending reply to originator\n");
                             struct sockaddr_in udp_addr;
@@ -301,12 +313,18 @@ int main(int argc, char **argv) {
                             send_udp_message(datagram_socket , received_msg->message_type, received_msg->hash_id, received_msg->node_id, 
                             ip_str, received_msg->node_port, udp_addr.sin_addr, udp_addr.sin_port);    
                         }
-                         
+                          
                     }
                 } else {
                     printf("got reply\n");
                     // find lookup in requests[] and write
-                    int index = fetch_req_index(received_msg->hash_id);
+                    int index = -1;
+                    for (int i = 0; i < MAX_REQUESTS; i++) {
+                        if (requests[i].hash_id == received_msg->hash_id) {
+                            index = i;
+                            break;
+                        }
+                    }
                     if (index >= 0) {
                         printf("request found overwriting...\n");
                         inet_ntop(AF_INET, &received_msg->ip_address, requests[index].node_ip, sizeof(requests[index].node_ip));
@@ -316,8 +334,6 @@ int main(int argc, char **argv) {
                         perror("hash not found");
                     }
                 }
-                
-
             } else  {
                 assert(s == state.sock);
 
@@ -341,6 +357,7 @@ int main(int argc, char **argv) {
 
     return EXIT_SUCCESS;
 }
+
 
 /**
  * Sends an HTTP reply to the client based on the received request.
@@ -637,21 +654,7 @@ void send_udp_message(int socket ,uint8_t message_type, uint16_t hash_id, uint16
     } 
 }
 
-void add_request(struct lookup_request new_request) {
-    // If the list is full, overwrite the oldest request
-    if (request_count >= MAX_REQUESTS) {
-        request_count = 0; // Reset to the start of the array
-    }
-    requests[request_count] = new_request;
-    (request_count)++;
-}
 
-int has_request(uint16_t hash_id) {
-    for (int i = 0;i < MAX_REQUESTS;i++) {
-        if (requests[i].hash_id == hash_id) return 1;
-    }
-    return 0;
-}
 void find_and_write(uint16_t hash_id, char* ip, char* port);
 void find_and_write(uint16_t hash_id, char* ip, char* port) {
     for (int i = 0;i < MAX_REQUESTS;i++) {
@@ -663,9 +666,4 @@ void find_and_write(uint16_t hash_id, char* ip, char* port) {
     }
 }
 
-int fetch_req_index(uint16_t hash_id) {
-    for (int i = 0;i < MAX_REQUESTS;i++) {
-        if (requests[i].hash_id == hash_id) return i;
-    }
-    return -1;
-}
+
