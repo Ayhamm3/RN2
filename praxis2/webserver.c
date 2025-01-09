@@ -54,22 +54,14 @@ struct lookup_request requests[MAX_REQUESTS];
 
 char *PRED_ID, *PRED_IP, *PRED_PORT, *SUCC_ID, *SUCC_IP, *SUCC_PORT, *ID, *IP, *PORT;
 
-void send_reply(int conn, struct request *request, int udp_socket);
-size_t process_packet(int conn, char *buffer, size_t n, int udp_socket);
-static void connection_setup(struct connection_state *state, int sock);
-char *buffer_discard(char *buffer, size_t discard, size_t keep);
-bool handle_connection(struct connection_state *state, int udp_socket);
-static struct sockaddr_in derive_sockaddr(const char *host, const char *port);
-static int setup_server_socket(struct sockaddr_in addr);
-static int setup_datagram_socket(const char *host, const char *port);
-void send_udp_message(int socket ,uint8_t message_type, uint16_t hash_id, uint16_t node_id, char* ip_address, uint16_t node_port, struct in_addr send_ip, uint16_t send_port);
-void add_request(struct lookup_request new_request);
-int has_request(uint16_t hash_id);
-void find_and_write(uint16_t hash_id, char* ip, char* port);
-int fetch_req_index(uint16_t hash_id);
 
+int has_request(uint16_t hash_id);
+int fetch_req_index(uint16_t hash_id);
+void add_request(struct lookup_request new_request);
+void send_udp_message(int socket ,uint8_t message_type, uint16_t hash_id, uint16_t node_id, char* ip_address, uint16_t node_port, struct in_addr send_ip, uint16_t send_port);
+static struct sockaddr_in derive_sockaddr(const char *host, const char *port);
+void send_reply(int conn, struct request *request, int udp_socket);
 void send_reply(int conn, struct request *request, int udp_socket) {
-    // Common HTTP response templates
     const char *OK_REPLY_FORMAT = "HTTP/1.1 200 OK\r\nContent-Length: %lu\r\n\r\n";
     const char *NOT_FOUND_REPLY = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
     const char *SERVICE_UNAVAILABLE_REPLY = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n";
@@ -154,6 +146,10 @@ void send_reply(int conn, struct request *request, int udp_socket) {
     }
 }
 
+static int setup_datagram_socket(const char *host, const char *port);
+static int setup_server_socket(struct sockaddr_in addr);
+static void connection_setup(struct connection_state *state, int sock);
+bool handle_connection(struct connection_state *state, int udp_socket);
 int main(int argc, char **argv) {
     // uint16_t h1 = pseudo_hash("/static/foo", sizeof "/static/foo" - 1);
     // uint16_t h2 = pseudo_hash("/static/bar", sizeof "/static/bar" - 1);
@@ -369,6 +365,7 @@ int main(int argc, char **argv) {
  * malformed or an error occurs during processing, the return value is -1.
  *
  */
+size_t process_packet(int conn, char *buffer, size_t n, int udp_socket);
 size_t process_packet(int conn, char *buffer, size_t n, int udp_socket) {
     struct request request = {
         .method = NULL, .uri = NULL, .payload = NULL, .payload_length = -1};
@@ -396,6 +393,7 @@ size_t process_packet(int conn, char *buffer, size_t n, int udp_socket) {
     return bytes_processed;
 }
 
+
 /**
  * Sets up the connection state for a new socket connection.
  *
@@ -415,6 +413,7 @@ static void connection_setup(struct connection_state *state, int sock) {
     memset(state->buffer, 0, HTTP_MAX_SIZE);
 }
 
+char *buffer_discard(char *buffer, size_t discard, size_t keep);
 /**
  * Discards the front of a buffer
  *
@@ -474,6 +473,7 @@ bool handle_connection(struct connection_state *state, int udp_socket) {
                                 window_end - window_start);
     return true;
 }
+
 
 /**
  * Derives a sockaddr_in structure from the provided host and port information.
@@ -652,7 +652,7 @@ int has_request(uint16_t hash_id) {
     }
     return 0;
 }
-
+void find_and_write(uint16_t hash_id, char* ip, char* port);
 void find_and_write(uint16_t hash_id, char* ip, char* port) {
     for (int i = 0;i < MAX_REQUESTS;i++) {
         if (requests[i].hash_id == hash_id) {
