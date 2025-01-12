@@ -52,7 +52,7 @@ struct lookup_request {
 int request_count = 0; // Tracks the number of stored requests
 struct lookup_request requests[MAX_REQUESTS];
 
-char *PRED_ID, *PRED_IP, *PRED_PORT, *SUCC_ID, *SUCC_IP, *SUCC_PORT, *ID, *IP, *PORT;
+char *PRED_ID, *PRED_IP, *PRED_PORT, *SUCC_ID, *SUCC_IP, *SUCC_PORT, *NODEID, *IP, *PORT;
 
 
 int has_request(uint16_t hash_id);
@@ -108,7 +108,7 @@ void send_reply(int conn, struct request *request, int udp_socket) {
             offset += resource_length;
         } else {
             // Resource not found
-            if (strcmp(PRED_ID, SUCC_ID) == 0 && uri_hash != atoi(ID)) {
+            if (strcmp(PRED_ID, SUCC_ID) == 0 && uri_hash != atoi(NODEID)) {
                 reply = NOT_FOUND_REPLY;
             } else {
                 if (!has_request(uri_hash)) {
@@ -116,7 +116,7 @@ void send_reply(int conn, struct request *request, int udp_socket) {
                     reply = SERVICE_UNAVAILABLE_REPLY;
 
                     struct sockaddr_in udp_addr = derive_sockaddr(SUCC_IP, SUCC_PORT);
-                    send_udp_message(udp_socket, 0, htons(uri_hash), htons(atoi(ID)), IP, htons(atoi(PORT)), udp_addr.sin_addr, udp_addr.sin_port);
+                    send_udp_message(udp_socket, 0, htons(uri_hash), htons(atoi(NODEID)), IP, htons(atoi(PORT)), udp_addr.sin_addr, udp_addr.sin_port);
 
                     // Inline add_request logic
                     static int request_count = 0;  // Ensure this is declared
@@ -172,181 +172,203 @@ static int setup_datagram_socket(const char *host, const char *port);
 static int setup_server_socket(struct sockaddr_in addr);
 static void connection_setup(struct connection_state *state, int sock);
 bool handle_connection(struct connection_state *state, int udp_socket);
-int main(int argc, char **argv) {
+int main(int argc, char **argv) 
+{
     PRED_ID = getenv("PRED_ID");
     PRED_IP = getenv("PRED_IP");
     PRED_PORT = getenv("PRED_PORT");
     SUCC_ID = getenv("SUCC_ID");
     SUCC_IP = getenv("SUCC_IP");
     SUCC_PORT = getenv("SUCC_PORT");
-    if (argc > 3) {
-        ID = argv[3];
-    } else {
-        ID = "0"; 
-    }
+
+    if (argc > 3) 
+        NODEID = argv[3];
+    else 
+        NODEID = "0"; 
+
     IP = argv[1];
     PORT = argv[2];
 
     memset(requests, 0, sizeof(requests));
 
-    struct sockaddr_in addr = derive_sockaddr(argv[1], argv[2]);
-
-    // Set up a server socket.
-    int server_socket = setup_server_socket(addr);
-
-    // Set up a datagram socket
+    struct sockaddr_in socketaddr = derive_sockaddr(argv[1], argv[2]);
+    int server_socket = setup_server_socket(socketaddr);
     int datagram_socket = setup_datagram_socket(argv[1], argv[2]);
 
-    // Create an array of pollfd structures to monitor sockets.
-    struct pollfd sockets[2] = {
+    // monitor sockets
+    struct pollfd sockets[2] = 
+    {
         {.fd = server_socket, .events = POLLIN},
         {.fd = datagram_socket, .events = POLLIN},
     };
 
     struct connection_state state = {0};
-    while (true) {
+    while (true) 
+    {
 
-        // Use poll() to wait for events on the monitored sockets.
+        // wait for events to monitor
         int ready = poll(sockets, sizeof(sockets) / sizeof(sockets[0]), -1);
-        if (ready == -1) {
+        if (ready == -1) 
+        {
             perror("poll");
             exit(EXIT_FAILURE);
         }
-        printf("UDP socket descriptor: %d\n", datagram_socket);
-        // Process events on the monitored sockets.
-        for (size_t i = 0; i < sizeof(sockets) / sizeof(sockets[0]); i += 1) {
-            if (sockets[i].revents != POLLIN) {
-                // If there are no POLLIN events on the socket, continue to the
-                // next iteration.
+        printf("Datagram socket: %d\n", datagram_socket);
+        // Process events
+        for (size_t i = 0; i < sizeof(sockets) / sizeof(sockets[0]); i += 1) 
+        {
+            if (sockets[i].revents != POLLIN) 
+            {
+                // No event available, go to next socket
                 continue;
             }
             int s = sockets[i].fd;
 
-            if (s == server_socket) {
-                printf("doing tcp\n");
-                // If the event is on the server_socket, accept a new connection
-                // from a client.
+            // Socket found to handle the event
+            if (s == server_socket) 
+            {
+                printf("handling tcp...\n");
                 int connection = accept(server_socket, NULL, NULL);
                 if (connection == -1 && errno != EAGAIN &&
                     errno != EWOULDBLOCK) {
                     close(server_socket);
                     perror("accept");
                     exit(EXIT_FAILURE);
-                } else {
+                } 
+                else 
+                {
                     connection_setup(&state, connection);
 
-                    // limit to one connection at a time
+                    // one connection at a time
                     sockets[0].events = 0;
                     sockets[1].fd = connection;
                     sockets[1].events = POLLIN;
                 }
                 printf("end tcp\n");
-            } else if (s == datagram_socket) {
+            } 
+            else if (s == datagram_socket) 
+            {
                 char buffer[1024];
-                struct sockaddr_in sender_addr;
-                socklen_t addr_len = sizeof(sender_addr);
-
-                ssize_t num_bytes = recvfrom(s, buffer, sizeof(buffer), 0,
-                                            (struct sockaddr *)&sender_addr, &addr_len);
-                if (num_bytes == -1) {
+                struct sockaddr_in senderAddr;
+                socklen_t addr_len = sizeof(senderAddr);
+                ssize_t bytenum = recvfrom(s, buffer, sizeof(buffer), 0, (struct sockaddr *)&senderAddr, &addr_len);
+                if (bytenum == -1) 
+                {
                     perror("recvfrom");
                     continue;
                 }
 
-                if (num_bytes < sizeof(struct message)) {
+                if (bytenum < sizeof(struct message)) 
+                {
                     fprintf(stderr, "Received message is too short to unpack\n");
                     continue;
                 }
 
-                // Cast the buffer to a pointer to your struct message
                 struct message *received_msg = (struct message *)buffer;
-
-                // Access the fields of the unpacked struct
                 printf("Received UDP message:\n");
-                printf("  Message Type: %u\n", received_msg->message_type);
-                printf("  PRED ID: %u\n", atoi(PRED_ID)); 
-                printf("  CURR ID: %u\n", atoi(ID)); 
-                printf("  Hash ID: %u\n", ntohs(received_msg->hash_id));  // Convert from network to host byte order
-                printf("  SUCC ID: %u\n", atoi((SUCC_ID))); 
-                printf("  Node ID: %u\n", ntohs(received_msg->node_id));  // Convert from network to host byte order
-                char ip_str[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &received_msg->ip_address, ip_str, sizeof(ip_str)); // Convert IP to string
-                printf("  IP Address: %s\n", ip_str);
-                printf("  Node Port: %u\n", ntohs(received_msg->node_port)); 
-                printf("  SUCC IP: %s\n", SUCC_IP);
-                printf("  SUCC Port: %s\n", SUCC_PORT); 
+                printf("\tMessage Type: %u\n", received_msg->message_type);
+                printf("\tPRED ID: %u\n", atoi(PRED_ID)); 
+                printf("\tCURR ID: %u\n", atoi(NODEID)); 
+                printf("\tHash ID: %u\n", ntohs(received_msg->hash_id));  // Convert from network to host byte order
+                printf("\tSUCC ID: %u\n", atoi((SUCC_ID))); 
+                printf("\tNode ID: %u\n", ntohs(received_msg->node_id));  // Convert from network to host byte order
+                char ip_chr[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &received_msg->ip_address, ip_chr, sizeof(ip_chr)); // Convert IP to char
+                printf("\tIP Address: %s\n", ip_chr);
+                printf("\tNode Port: %u\n", ntohs(received_msg->node_port)); 
+                printf("\tSUCC IP: %s\n", SUCC_IP);
+                printf("\tSUCC Port: %s\n", SUCC_PORT); 
 
-                if (received_msg->message_type == 0) {
-                    if (ntohs(received_msg->hash_id) > atoi(ID) && ntohs(received_msg->hash_id) < atoi(SUCC_ID)) { // Successor responsible
+                if (received_msg->message_type == 0) 
+                {
+                    // successor
+                    if (ntohs(received_msg->hash_id) > atoi(NODEID) && ntohs(received_msg->hash_id) < atoi(SUCC_ID)) 
+                    {
                         printf("res\n");
-                        send_udp_message(datagram_socket , 1, htons(atoi(ID)), htons(atoi(SUCC_ID)), SUCC_IP, htons(atoi(SUCC_PORT)), 
-                        received_msg->ip_address, received_msg->node_port);
-                    } else if (ntohs(received_msg->hash_id) < atoi(ID) && ntohs(received_msg->hash_id) > atoi(SUCC_ID)) { // Current responsible
-                        send_udp_message(datagram_socket , 1, htons(atoi(PRED_ID)), htons(atoi(ID)), IP, htons(atoi(PORT)), 
-                        received_msg->ip_address, received_msg->node_port);
-                    } else { // forward lookup
-                        char ip_succ[INET_ADDRSTRLEN];
-                        inet_ntop(AF_INET, &received_msg->ip_address, ip_str, sizeof(ip_str));
+                        send_udp_message(datagram_socket , 1, htons(atoi(NODEID)), htons(atoi(SUCC_ID)), SUCC_IP, htons(atoi(SUCC_PORT)), received_msg->ip_address, received_msg->node_port);
+                    } 
+                    // current
+                    else if (ntohs(received_msg->hash_id) < atoi(NODEID) && ntohs(received_msg->hash_id) > atoi(SUCC_ID)) 
+                    {
+                        send_udp_message(datagram_socket , 1, htons(atoi(PRED_ID)), htons(atoi(NODEID)), IP, htons(atoi(PORT)), received_msg->ip_address, received_msg->node_port);
+                    } 
+                    else // check forward
+                    {
+                        char succIp[INET_ADDRSTRLEN];
+                        inet_ntop(AF_INET, &received_msg->ip_address, ip_chr, sizeof(ip_chr));
 
-                        if (strcmp(ip_succ, SUCC_IP) == 0 || atoi(SUCC_PORT) == ntohs(received_msg->node_port)) {
-                            printf("end of line sending reply to originator\n");
-                            struct sockaddr_in udp_addr;
-                            memset(&udp_addr, 0, sizeof(udp_addr));
-                            udp_addr.sin_family = AF_INET;
-                            udp_addr.sin_port = htons(atoi(SUCC_PORT));         
-                            inet_pton(AF_INET, SUCC_IP, &udp_addr.sin_addr); 
+                        if (strcmp(succIp, SUCC_IP) == 0 || atoi(SUCC_PORT) == ntohs(received_msg->node_port)) 
+                        {
+                            // end of line
+                            printf("sending reply to initiator\n");
+                            struct sockaddr_in udpAddr;
+                            memset(&udpAddr, 0, sizeof(udpAddr));
+                            udpAddr.sin_family = AF_INET;
+                            udpAddr.sin_port = htons(atoi(SUCC_PORT));         
+                            inet_pton(AF_INET, SUCC_IP, &udpAddr.sin_addr); 
 
-                            char ip_str[INET_ADDRSTRLEN];
-                            inet_ntop(AF_INET, &received_msg->ip_address, ip_str, sizeof(ip_str));
+                            char ipChar[INET_ADDRSTRLEN];
+                            inet_ntop(AF_INET, &received_msg->ip_address, ipChar, sizeof(ipChar));
                             send_udp_message(datagram_socket , 1, received_msg->hash_id, received_msg->node_id, 
-                            ip_str, received_msg->node_port, udp_addr.sin_addr, udp_addr.sin_port);    
-                        } else {
-                            printf("forward kek\n");
-                            struct sockaddr_in udp_addr;
-                            memset(&udp_addr, 0, sizeof(udp_addr));
-                            udp_addr.sin_family = AF_INET;
-                            udp_addr.sin_port = htons(atoi(SUCC_PORT));         
-                            inet_pton(AF_INET, SUCC_IP, &udp_addr.sin_addr); 
+                            ipChar, received_msg->node_port, udpAddr.sin_addr, udpAddr.sin_port);    
+                        } 
+                        else 
+                        {
+                            printf("forward\n");
+                            struct sockaddr_in udpAddr;
+                            memset(&udpAddr, 0, sizeof(udpAddr));
+                            udpAddr.sin_family = AF_INET;
+                            udpAddr.sin_port = htons(atoi(SUCC_PORT));         
+                            inet_pton(AF_INET, SUCC_IP, &udpAddr.sin_addr); 
 
-                            char ip_str[INET_ADDRSTRLEN];
-                            inet_ntop(AF_INET, &received_msg->ip_address, ip_str, sizeof(ip_str));
+                            char ipChar[INET_ADDRSTRLEN];
+                            inet_ntop(AF_INET, &received_msg->ip_address, ipChar, sizeof(ipChar));
                             send_udp_message(datagram_socket , received_msg->message_type, received_msg->hash_id, received_msg->node_id, 
-                            ip_str, received_msg->node_port, udp_addr.sin_addr, udp_addr.sin_port);    
+                            ipChar, received_msg->node_port, udpAddr.sin_addr, udpAddr.sin_port);    
                         }
                           
                     }
-                } else {
+                } 
+                else 
+                {
                     printf("got reply\n");
-                    // find lookup in requests[] and write
+                    // find lookup in requests
                     int index = -1;
-                    for (int i = 0; i < MAX_REQUESTS; i++) {
-                        if (requests[i].hash_id == received_msg->hash_id) {
+                    for (int i = 0; i < MAX_REQUESTS; i++) 
+                    {
+                        if (requests[i].hash_id == received_msg->hash_id) 
+                        {
                             index = i;
                             break;
                         }
                     }
-                    if (index >= 0) {
+                    if (index >= 0) 
+                    {
                         printf("request found overwriting...\n");
                         inet_ntop(AF_INET, &received_msg->ip_address, requests[index].node_ip, sizeof(requests[index].node_ip));
                         requests[index].node_port = received_msg->node_port;
-                    } else {
+                    } 
+                    else 
+                    {
                         printf("request not found\n");
                         perror("hash not found");
                     }
                 }
-            } else  {
+            } 
+            else
+            {
                 assert(s == state.sock);
-
-                // Call the 'handle_connection' function to process the incoming
-                // data on the socket.
+                // process incoming data on socket (via handleconnection)
                 bool cont = handle_connection(&state, datagram_socket);
-                if (!cont) { // get ready for a new connection
+                if (!cont) 
+                { // get ready for a new connection
                     printf("reset\n");
                     sockets[0].events = POLLIN;
                     sockets[1].events = POLLIN;
                     sockets[2].fd = -1;
                     sockets[2].events = 0;
-                    if (sockets[1].fd != datagram_socket) {
+                    if (sockets[1].fd != datagram_socket) 
+                    {
                         sockets[1].fd = -1;
                         sockets[1].events = 0;
                     }
@@ -354,7 +376,6 @@ int main(int argc, char **argv) {
             }
         }
     }
-
     return EXIT_SUCCESS;
 }
 
