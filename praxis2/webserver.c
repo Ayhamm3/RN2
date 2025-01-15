@@ -60,7 +60,30 @@ int server_socket, datagram_socket;
 
 
 int has_request(uint16_t hash_id);
+int has_request(uint16_t hash_id) {
+    for (int i = 0; i < MAX_REQUESTS; i++) 
+    {
+        if (requests[i].hash_id == hash_id) 
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int fetch_req_index(uint16_t hash_id);
+int fetch_req_index(uint16_t hash_id) 
+{
+    for (int i = 0; i < MAX_REQUESTS; i++) 
+    {
+        if (requests[i].hash_id == hash_id) 
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
 void add_request(struct lookup_request new_request);
 void send_udp_message(int socket, uint8_t message_type, uint16_t hash_id, uint16_t node_id, const char *ip_address, uint16_t node_port, struct in_addr send_ip, uint16_t send_port);
 static struct sockaddr_in derive_sockaddr(const char *host, const char *port);
@@ -81,87 +104,127 @@ void send_reply(int conn, struct request *request, int udp_socket) {
     char uri_hash_string[6];
     snprintf(uri_hash_string, sizeof(uri_hash_string), "%u", uri_hash);
 
-    // Inline helper functions
-    int has_request(uint16_t hash_id) {
-        for (int i = 0; i < MAX_REQUESTS; i++) {
-            if (requests[i].hash_id == hash_id) return 1;
-        }
-        return 0;
-    }
-
-    int fetch_req_index(uint16_t hash_id) {
-        for (int i = 0; i < MAX_REQUESTS; i++) {
-            if (requests[i].hash_id == hash_id) return i;
-        }
-        return -1;
-    }
-
     // Buffer to store the reply
     char buffer[HTTP_MAX_SIZE];
     char *reply = buffer;  // Ensure this is modifiable, not 'const char *'
     size_t offset = 0;
 
-    if (strcmp(request->method, "GET") == 0) {
+    if (strcmp(request->method, "GET") == 0) 
+    {
         size_t resource_length;
         const char *resource = get(uri_hash_string, resources, MAX_RESOURCES, &resource_length);
 
-        if (resource) {
+        if (resource) 
+        {
             // Resource found
             offset = snprintf(reply, HTTP_MAX_SIZE, OK_REPLY_FORMAT, resource_length);
             memcpy(reply + offset, resource, resource_length);
             offset += resource_length;
-        } else {
-            // Resource not found
-            if (strcmp(PRED_ID, SUCC_ID) == 0 && uri_hash != atoi(NODEID)) {
-                reply = (char *)NOT_FOUND_REPLY;  // Cast to 'char *' explicitly
-            } else {
-                if (!has_request(uri_hash)) {
-                    // Request not in progress, send service unavailable
-                    reply = (char *)SERVICE_UNAVAILABLE_REPLY;  // Cast to 'char *' explicitly
+        } 
+        else 
+        {
+            if (strcmp(PRED_ID, SUCC_ID) == 0) 
+            {
+                uint16_t pred = (uint16_t) atoi(PRED_ID);
+                uint16_t my_id = (uint16_t) atoi(NODEID);
+                bool responsible = false;
+                
+                if (pred < my_id) 
+                {
+                    // normal
+                    if (uri_hash > pred && uri_hash <= my_id) 
+                    {
+                        responsible = true;
+                    }
+                } 
+                else 
+                {
+                    // wrap-around
+                    if (uri_hash > pred || uri_hash <= my_id) 
+                    {
+                        responsible = true;
+                    }
+                }
+
+                if (responsible) 
+                {
+                    reply = (char *)NOT_FOUND_REPLY;
+                    offset = strlen(reply);
+                } 
+                else 
+                {
+                    snprintf(buffer, HTTP_MAX_SIZE, "HTTP/1.1 303 See Other\r\nLocation: http://%s:%s%s\r\nContent-Length: 0\r\n\r\n", SUCC_IP, SUCC_PORT, request->uri);
+                    reply = buffer;
+                    offset = strlen(reply);
+                }
+            } 
+            else 
+            {
+                if (!has_request(uri_hash)) 
+                {
+                    // no dht answer known, 503
+                    reply = (char *)SERVICE_UNAVAILABLE_REPLY;
+                    offset = strlen(reply);
 
                     struct sockaddr_in udp_addr = derive_sockaddr(SUCC_IP, SUCC_PORT);
-                    send_udp_message(udp_socket, 0, htons(uri_hash), htons(atoi(NODEID)), IP, htons(atoi(PORT)), udp_addr.sin_addr, udp_addr.sin_port);
+                    send_udp_message(udp_socket, 0, htons(uri_hash),
+                                     htons(atoi(NODEID)), IP, htons(atoi(PORT)),
+                                     udp_addr.sin_addr, udp_addr.sin_port);
 
-                    // Inline add_request logic
-                    static int request_count = 0;  // Ensure this is declared
+                    static int request_count = 0;
                     struct lookup_request new_request = {uri_hash, NULL, 0};
                     if (request_count >= MAX_REQUESTS) {
-                        request_count = 0;  // Reset to the start of the array
+                        request_count = 0;
                     }
                     requests[request_count] = new_request;
                     request_count++;
-                } else {
-                    // Request in progress, check if we have an answer
+                } 
+                else 
+                {
                     int index = fetch_req_index(uri_hash);
-                    if (index == -1 || requests[index].node_ip == NULL || requests[index].node_port == 0)
- {
-                        reply = (char *)NOT_FOUND_REPLY;  // Cast to 'char *' explicitly
-                    } else {
-                        snprintf(reply, HTTP_MAX_SIZE, SEE_OTHER_REPLY_FORMAT,
-                                 requests[index].node_ip, requests[index].node_port, request->uri);
-                        memset(&requests[index], 0, sizeof(struct request));
+                    if (index == -1 || requests[index].node_ip == NULL || requests[index].node_port == 0) 
+                    {
+                        reply = (char *)NOT_FOUND_REPLY;
+                        offset = strlen(reply);
+                    } 
+                    else 
+                    {
+                        snprintf(reply, HTTP_MAX_SIZE, "HTTP/1.1 303 See Other\r\nLocation: http://%s:%u%s\r\nContent-Length: 0\r\n\r\n", requests[index].node_ip, ntohs(requests[index].node_port), request->uri);
+                        memset(&requests[index], 0, sizeof(struct lookup_request));
+                        offset = strlen(reply);
                     }
                 }
             }
-            offset = strlen(reply);
         }
-    } else if (strcmp(request->method, "PUT") == 0) {
-        if (set(uri_hash_string, request->payload, request->payload_length, resources, MAX_RESOURCES)) {
-            reply = (char *)NO_CONTENT_REPLY;  // Cast to 'char *' explicitly
-        } else {
-            reply = (char *)CREATED_REPLY;  // Cast to 'char *' explicitly
-        }
-        offset = strlen(reply);
-    } else if (strcmp(request->method, "DELETE") == 0) {
-        if (delete(uri_hash_string, resources, MAX_RESOURCES)) {
-            reply = (char *)NO_CONTENT_REPLY;  // Cast to 'char *' explicitly
-        } else {
-            reply = (char *)NOT_FOUND_REPLY;  // Cast to 'char *' explicitly
+    } 
+    else if (strcmp(request->method, "PUT") == 0) 
+    {
+        if (set(uri_hash_string, request->payload, request->payload_length, resources, MAX_RESOURCES)) 
+        {
+            reply = (char *)NO_CONTENT_REPLY;
+        } 
+        else
+        {
+            reply = (char *)CREATED_REPLY;
         }
         offset = strlen(reply);
-    } else {
+    } 
+    else if (strcmp(request->method, "DELETE") == 0) 
+    {
+        if (delete(uri_hash_string, resources, MAX_RESOURCES)) 
+        {
+            reply = (char *)NO_CONTENT_REPLY;
+        } 
+        else 
+        {
+            reply = (char *)NOT_FOUND_REPLY;
+        }
+        offset = strlen(reply);
+    } 
+    else 
+    {
         // Unsupported method
-        reply = (char *)METHOD_NOT_SUPPORTED_REPLY;  // Cast to 'char *' explicitly
+        reply = (char *)METHOD_NOT_SUPPORTED_REPLY;
         offset = strlen(reply);
     }
 
@@ -171,6 +234,7 @@ void send_reply(int conn, struct request *request, int udp_socket) {
         close(conn);
     }
 }
+
 
 
 static int setup_datagram_socket(const char *host, const char *port);
@@ -488,7 +552,7 @@ size_t process_packet(int conn, char *buffer, size_t n, int udp_socket) {
         // Check the "Connection" header in the request to determine if the
         // connection should be kept alive or closed.
         const string connection_header = get_header(&request, "Connection");
-        if (connection_header && strcmp(connection_header, "close")) {
+        if (connection_header && !strcasecmp(connection_header, "close")) {
             return -1;
         }
     } else if (bytes_processed == -1) {
