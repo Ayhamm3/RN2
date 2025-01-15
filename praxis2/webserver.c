@@ -369,16 +369,47 @@ void handle_successor_or_current(struct message *received_msg, int datagram_sock
 void forward_message(struct message *received_msg, int datagram_socket) 
 {
     printf("Forwarding message to successor\n");
+
+    // Initialize the successor's address structure
     struct sockaddr_in udpAddr;
     memset(&udpAddr, 0, sizeof(udpAddr));
     udpAddr.sin_family = AF_INET;
-    udpAddr.sin_port = htons(atoi(SUCC_PORT));         
-    inet_pton(AF_INET, SUCC_IP, &udpAddr.sin_addr); 
 
+    // Convert and set the successor's port
+    char *endptr;
+    long port_value = strtol(SUCC_PORT, &endptr, 10);
+    if (*endptr != '\0' || port_value <= 0 || port_value > 65535) {
+        fprintf(stderr, "Invalid SUCC_PORT value: %s\n", SUCC_PORT);
+        return;
+    }
+    udpAddr.sin_port = htons((uint16_t)port_value);
+
+    // Convert and set the successor's IP address
+    if (inet_pton(AF_INET, SUCC_IP, &udpAddr.sin_addr) != 1) {
+        perror("Error converting successor IP address");
+        return;
+    }
+
+    // Extract and convert the sender's IP address to a string
     char ipChar[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &received_msg->ip_address, ipChar, sizeof(ipChar));
-    send_udp_message(datagram_socket, received_msg->message_type, received_msg->hash_id, received_msg->node_id, ipChar, received_msg->node_port, udpAddr.sin_addr, udpAddr.sin_port);
+    if (inet_ntop(AF_INET, &received_msg->ip_address, ipChar, sizeof(ipChar)) == NULL) {
+        perror("Error converting sender IP address");
+        return;
+    }
+
+    // Send the message to the successor
+    send_udp_message(
+        datagram_socket,              // Datagram socket descriptor
+        received_msg->message_type,   // Type of the message
+        received_msg->hash_id,        // Hash ID associated with the message
+        received_msg->node_id,        // ID of the node sending the message
+        ipChar,                       // Sender's IP address in string form
+        received_msg->node_port,      // Sender's port
+        udpAddr.sin_addr,             // Successor's IP address
+        udpAddr.sin_port              // Successor's port
+    );
 }
+
 
 // Handle the reply message received via UDP
 void handle_reply(struct message *received_msg) 
@@ -697,34 +728,47 @@ static int setup_datagram_socket(const char *host, const char *port) {
     return sock;
 }
 
-void send_udp_message(int socket, uint8_t message_type, uint16_t hash_id, uint16_t node_id, const char *ip_address, uint16_t node_port, struct in_addr send_ip, uint16_t send_port) {
+void send_udp_message(int socket, uint8_t message_type, uint16_t hash_id, uint16_t node_id, const char *ip_address, uint16_t node_port, struct in_addr send_ip, uint16_t send_port) 
+{
     struct message udp_message;
-    
-    // Set up the UDP message
-    udp_message.message_type = message_type;
-    udp_message.hash_id = hash_id;
-    udp_message.node_id = node_id;
-    
 
-    if (inet_pton(AF_INET, ip_address, &udp_message.ip_address) != 1) {
-        fprintf(stderr, "Error: Invalid IP address format '%s'\n", ip_address);
-        return; // Early return on error
+    // Initialize the UDP message fields
+    udp_message = (struct message){
+        .message_type = message_type,
+        .hash_id = hash_id,
+        .node_id = node_id,
+        .ip_address = {0},
+        .node_port = node_port
+    };
+
+    if (inet_pton(AF_INET, ip_address, &udp_message.ip_address) <= 0) {
+        fprintf(stderr, "Error: Unable to parse IP address '%s'\n", ip_address);
+        return;
     }
 
-    udp_message.node_port = node_port;
-
-
+    // Configure the destination address for the UDP message
     struct sockaddr_in udp_addr;
-    memset(&udp_addr, 0, sizeof(udp_addr));
-    udp_addr.sin_family = AF_INET;
-    udp_addr.sin_port = send_port; 
-    udp_addr.sin_addr = send_ip;    
+    memset(&udp_addr, 0, sizeof(udp_addr)); // Zero out the structure
 
-    // Send the message over UDP
-    if (sendto(socket, &udp_message, sizeof(udp_message), 0, (struct sockaddr*)&udp_addr, sizeof(udp_addr)) < 0) {
+    udp_addr.sin_family = AF_INET;
+    udp_addr.sin_port = send_port;
+    udp_addr.sin_addr = send_ip;
+
+    // Attempt to send the UDP message
+    ssize_t bytes_sent = sendto(
+        socket,
+        &udp_message,
+        sizeof(udp_message),
+        0,
+        (struct sockaddr*)&udp_addr,
+        sizeof(udp_addr)
+    );
+
+    if (bytes_sent < 0) {
         perror("Error: Failed to send UDP message");
-    } 
+    }
 }
+
 
 void find_and_write(uint16_t hash_id, const char *ip, const char *port);
 void find_and_write(uint16_t hash_id, const char *ip, const char *port) {
@@ -740,6 +784,3 @@ void find_and_write(uint16_t hash_id, const char *ip, const char *port) {
     // If no match was found, optionally print an error or handle it
     fprintf(stderr, "Error: No matching request found for hash_id %u\n", hash_id);
 }
-
-
-
